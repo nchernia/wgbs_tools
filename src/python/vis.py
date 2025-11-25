@@ -53,6 +53,7 @@ def beta_args(parser):
     parser.add_argument('--colorbar', action='store_true',
             help='beta vis: output ascii colorbar')
     parser.add_argument('--plot', action='store_true', help='beta vis: plot results in a heatmap.')
+    parser.add_argument('--highlight', help='Path or basename of beta file to highlight in the plot')
 
 
 def parse_args():

@@ -44,7 +44,6 @@ class BetaVis:
         return dsets
 
     def build_vals_line(self, data):
-
         # build a list of single character values.
         with np.errstate(divide='ignore', invalid='ignore'):
             vec = np.round((data[:, 0] / data[:, 1] * 10), 0).astype(int)  # normalize to range [0, 10)
@@ -89,17 +88,98 @@ class BetaVis:
 
     def plot_all(self):
         import matplotlib.pyplot as plt
+        # Case 1: Highlight mode (scatter + mean line)
+        if self.args.highlight is not None:
+            highlight_path = self.args.highlight
+            highlight_name = op.splitext(op.basename(highlight_path))[0]
 
+            # Find index of highlighted file
+            try:
+                idx_highlight = [op.splitext(op.basename(f))[0] for f in self.files].index(highlight_name)
+            except ValueError:
+                print(f"[Error] Highlight file '{highlight_name}' not found among inputs.")
+                return
+
+            # Extract all beta values (shape: n_files x n_sites)
+            betas = np.array([beta2vec(d) for d in self.dsets])  # each row = file, each col = CpG
+            # Get genomic positions for x-axis
+            positions = []
+            for site_idx in range(self.start, self.end):
+                _, locus = self.gr.index2locus(site_idx)
+                positions.append(locus)
+            x = np.array(positions)  # genomic positions
+
+            #x = np.arange(betas.shape[1])  # CpG index for now
+
+            # Compute mean of non-highlighted samples
+            mask = np.ones(betas.shape[0], dtype=bool)
+            mask[idx_highlight] = False
+            mean_non_highlight = np.nanmean(betas[mask, :], axis=0)
+
+            # Create figure with two subplots side by side
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+            # LEFT PLOT: Scatter plot with connected gray line
+            # Plot gray line connecting the gray points first (so it's behind)
+            for i in np.where(mask)[0]:
+                ax1.plot(x, betas[i, :], color='lightgray', linewidth=0.5, alpha=0.6, zorder=1)
+        
+            # Plot gray dots for other samples
+            ax1.scatter(
+              np.tile(x, mask.sum()),
+              betas[mask, :].flatten(),
+              color='gray',
+              s=8,
+              alpha=0.4,
+              label='Other samples',
+              zorder=2
+            )
+            # Plot line for mean
+            ax1.plot(x, mean_non_highlight, color='black', linewidth=2, label='Mean (others)', zorder=3)
+            # Plot blue dots for highlight
+            ax1.scatter(x, betas[idx_highlight, :], color='blue', s=15, label=highlight_name, zorder=4)
+
+            ax1.set_xlabel("Genomic position (bp)")
+            ax1.set_ylabel("Methylation (β)")
+            ax1.set_title(f"{highlight_name} {self.gr.region_str}")
+        
+            # RIGHT PLOT: Histogram of means
+            # Calculate mean methylation for each sample in this region
+            sample_means = np.nanmean(betas, axis=1)
+            # Create histogram
+            # Filter out NaN means before plotting
+            valid_means = sample_means[mask][~np.isnan(sample_means[mask])]
+            highlight_mean = sample_means[idx_highlight]
+            # Determine bins based on all valid data
+            all_valid = np.concatenate([valid_means, [highlight_mean]]) if not np.isnan(highlight_mean) else valid_means
+            bins = 20
+            hist_range = (np.nanmin(all_valid), np.nanmax(all_valid))
+        
+            # Plot histogram for other samples
+            ax2.hist(valid_means, bins=bins, range=hist_range, color='gray', alpha=0.7, edgecolor='black', label='Other samples')
+        
+            # Plot highlighted sample's mean as a blue bar
+            ax2.hist([highlight_mean], bins=bins, range=hist_range, color='blue', alpha=0.8, edgecolor='black', label=f'{highlight_name}')
+        
+            ax2.set_xlabel("Mean methylation (β)")
+            ax2.set_ylabel("Frequency")
+            ax2.set_title("Distribution of mean methylation")
+            ax2.legend(frameon=False)
+
+            plt.tight_layout()
+        
+            if self.args.output is not None:
+                plt.savefig(self.args.output, bbox_inches='tight')
+            plt.show()
+            return
+
+        # Case 2: Default heatmap plot (original behavior)
         fname_len = min(NR_CHARS_PER_FNAME, max([len(op.basename(op.splitext(f)[0])) for f in self.files]))
         ticks = [op.splitext(op.basename(f))[0][:fname_len].ljust(fname_len) for f in self.files]
-
         r = np.concatenate([beta2vec(d).reshape((1, -1)) for d in self.dsets])
-
         plt.imshow(1 - r, cmap='RdYlGn')
-        # insert borders:
         if self.borders.size:
             plt.vlines(self.borders - .5, -.5, len(self.files) - .5)
-
         plt.yticks(np.arange(len(self.files)), ticks)
         if self.args.title:
             plt.title(self.args.title)

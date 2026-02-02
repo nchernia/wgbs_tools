@@ -3,6 +3,7 @@
 import re
 import os.path as op
 import numpy as np
+import warnings
 from utils_wgbs import load_borders, load_beta_data, validate_file_list, color_text, \
         beta2vec, catch_BrokenPipeError, drop_dup_keep_order
 from genomic_region import GenomicRegion
@@ -136,6 +137,8 @@ class BetaVis:
             )
             # Plot line for mean
             ax1.plot(x, mean_non_highlight, color='black', linewidth=2, label='Mean (others)', zorder=3)
+            # Plot light blue line connecting the highlighted dots
+            ax1.plot(x, betas[idx_highlight, :], color='lightblue', linewidth=1.5, alpha=0.8, zorder=3.5)
             # Plot blue dots for highlight
             ax1.scatter(x, betas[idx_highlight, :], color='blue', s=15, label=highlight_name, zorder=4)
 
@@ -145,7 +148,9 @@ class BetaVis:
         
             # RIGHT PLOT: Histogram of means
             # Calculate mean methylation for each sample in this region
-            sample_means = np.nanmean(betas, axis=1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                sample_means = np.nanmean(betas, axis=1)
             # Create histogram
             # Filter out NaN means before plotting
             valid_means = sample_means[mask][~np.isnan(sample_means[mask])]

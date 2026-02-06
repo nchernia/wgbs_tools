@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 region_bimodal_vis.py - Enhanced with biallelic separation detection and GCS support
+
+For GCS files: Requires GCS_OAUTH_TOKEN environment variable
+Set with: export GCS_OAUTH_TOKEN=$(gcloud auth print-access-token)
+Token expires after ~1 hour and needs to be refreshed for long jobs.
 """
 import argparse
 import subprocess
@@ -14,17 +18,56 @@ import matplotlib
 import warnings
 import csv
 import sys
-import tempfile
-import shutil
+import time
 from genomic_region import GenomicRegion
 from sklearn.mixture import GaussianMixture
 
 METHYLATED = set(list("CMcm"))
 UNMETHYLATED = set(list("TUtu"))
 
+# Track when we last refreshed the GCS token
+_last_token_refresh = 0
+_token_refresh_interval = 3000  # Refresh every 50 minutes (3000 seconds)
+
 def is_gcs_path(path):
     """Check if path is a Google Cloud Storage path"""
     return path.startswith('gs://')
+
+def refresh_gcs_token_if_needed():
+    """
+    Refresh GCS OAuth token if it's been more than 50 minutes since last refresh.
+    Tokens expire after 1 hour, so we refresh proactively.
+    """
+    global _last_token_refresh
+    current_time = time.time()
+    
+    if current_time - _last_token_refresh > _token_refresh_interval:
+        try:
+            result = subprocess.check_output(['gcloud', 'auth', 'print-access-token'], 
+                                            stderr=subprocess.PIPE)
+            token = result.decode('utf-8').strip()
+            os.environ['GCS_OAUTH_TOKEN'] = token
+            _last_token_refresh = current_time
+            print(f"Refreshed GCS OAuth token", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to refresh GCS token: {e}", file=sys.stderr)
+
+def check_gcs_credentials():
+    """Check if GCS credentials are set up for files that need them"""
+    if 'GCS_OAUTH_TOKEN' not in os.environ:
+        try:
+            result = subprocess.check_output(['gcloud', 'auth', 'print-access-token'],
+                                            stderr=subprocess.PIPE)
+            token = result.decode('utf-8').strip()
+            os.environ['GCS_OAUTH_TOKEN'] = token
+            global _last_token_refresh
+            _last_token_refresh = time.time()
+            print("Set GCS_OAUTH_TOKEN from gcloud", file=sys.stderr)
+        except subprocess.CalledProcessError:
+            print("ERROR: GCS files require authentication.", file=sys.stderr)
+            print("Run: export GCS_OAUTH_TOKEN=$(gcloud auth print-access-token)", file=sys.stderr)
+            return False
+    return True
 
 def get_gcs_files(pattern):
     """
@@ -42,46 +85,6 @@ def get_gcs_files(pattern):
         print(f"Error listing GCS files: {e}", file=sys.stderr)
         return []
 
-class TempGCSFile:
-    """Context manager for temporarily downloading a GCS file"""
-    def __init__(self, gcs_path):
-        self.gcs_path = gcs_path
-        self.temp_dir = None
-        self.local_path = None
-        self.local_index_path = None
-    
-    def __enter__(self):
-        # Create temp directory
-        self.temp_dir = tempfile.mkdtemp(prefix='gcs_pat_')
-        
-        # Local filename
-        basename = op.basename(self.gcs_path)
-        self.local_path = op.join(self.temp_dir, basename)
-        self.local_index_path = self.local_path + '.tbi'
-        
-        # Download the .pat.gz file
-        print(f"   Downloading {self.gcs_path} ...", file=sys.stderr)
-        try:
-            subprocess.check_call(['gsutil', '-q', 'cp', self.gcs_path, self.local_path],
-                                stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to download {self.gcs_path}: {e}")
-        
-        # Download the .tbi index file
-        gcs_index = self.gcs_path + '.tbi'
-        try:
-            subprocess.check_call(['gsutil', '-q', 'cp', gcs_index, self.local_index_path],
-                                stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to download index {gcs_index}: {e}")
-        
-        return self.local_path
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # Clean up temp directory
-        if self.temp_dir and op.exists(self.temp_dir):
-            shutil.rmtree(self.temp_dir)
-
 def parse_region(region):
     """Parse a region string "chr:start-end" -> (chrom, start, end)"""
     m = re.match(r'^([^:]+):(\d+)(?:-(\d+))?$', region)
@@ -93,13 +96,61 @@ def parse_region(region):
     return chrom, start, end
 
 def pull_tabix(pat_file, region_str):
-    """Use tabix to extract lines for region_str"""
+    """
+    Use tabix to extract lines for region_str.
+    For GCS files without native tabix support, uses gsutil with tabix.
+    """
+    if is_gcs_path(pat_file):
+        # Use gsutil streaming approach for GCS files
+        return pull_tabix_gcs_via_gsutil(pat_file, region_str)
+    
+    # Local files: use tabix directly
     cmd = ["tabix", pat_file, region_str]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         return ""
     return out.decode('utf-8')
+
+def pull_tabix_gcs_via_gsutil(gcs_file, region_str):
+    """
+    Pull region from GCS file by streaming through gsutil.
+    This downloads the file and index temporarily just for the tabix query.
+    """
+    import tempfile
+    import shutil
+    
+    # Create temp directory
+    temp_dir = tempfile.mkdtemp(prefix='gcs_tabix_')
+    
+    try:
+        # Download file and index
+        basename = op.basename(gcs_file)
+        local_file = op.join(temp_dir, basename)
+        local_index = local_file + '.csi'
+        
+        # Download main file
+        subprocess.check_call(['gsutil', '-q', 'cp', gcs_file, local_file],
+                            stderr=subprocess.DEVNULL)
+        
+        # Download index
+        subprocess.check_call(['gsutil', '-q', 'cp', gcs_file + '.csi', local_index],
+                            stderr=subprocess.DEVNULL)
+        
+        # Run tabix on local copy
+        cmd = ["tabix", local_file, region_str]
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            result = out.decode('utf-8')
+        except subprocess.CalledProcessError:
+            result = ""
+        
+        return result
+        
+    finally:
+        # Clean up
+        if op.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 def parse_pat_lines(pat_text, region_start, region_end, strict=True, min_informative=10):
     """Parse tabix output into per-read entries"""
@@ -450,12 +501,8 @@ def process_single_file(pat_file, chrom, site_start, site_end, strict=True, min_
     new_start = max(1, site_start - 1500)
     pat_region = f"{chrom}:{new_start}-{site_end - 1}"
     
-    # Handle GCS files
-    if is_gcs_path(pat_file):
-        with TempGCSFile(pat_file) as local_file:
-            pat_text = pull_tabix(local_file, pat_region)
-    else:
-        pat_text = pull_tabix(pat_file, pat_region)
+    # Call tabix directly - works for both local and GCS files
+    pat_text = pull_tabix(pat_file, pat_region)
     
     fracs, read_rows = parse_pat_lines(pat_text, site_start, site_end, strict=strict, min_informative=min_informative)
     
@@ -579,6 +626,15 @@ def main():
     else:
         # Local glob
         pat_files = sorted(glob.glob(args.glob))
+    
+    # Check if we need GCS credentials
+    has_gcs_files = any(is_gcs_path(f) for f in pat_files)
+    if has_gcs_files:
+        if not check_gcs_credentials():
+            print("\nTo fix, run:", file=sys.stderr)
+            print("  export GCS_OAUTH_TOKEN=$(gcloud auth print-access-token)", file=sys.stderr)
+            sys.exit(1)
+        print(f"GCS authentication OK. Token will auto-refresh every 50 minutes.", file=sys.stderr)
     
     os.makedirs(args.out_dir, exist_ok=True)
     

@@ -16,9 +16,13 @@ import csv
 import sys
 from genomic_region import GenomicRegion
 from sklearn.mixture import GaussianMixture
+from utils_wgbs import MAX_PAT_LEN
 
-METHYLATED = set(list("CMcm"))
-UNMETHYLATED = set(list("TUtu"))
+METHYLATED = set(list("CM"))
+UNMETHYLATED = set(list("TU"))
+
+# Nanopore upstream extend (in CpG sites) to capture long reads
+NANOPORE_EXTEND = 100000
 
 def parse_region(region):
     """Parse a region string "chr:start-end" -> (chrom, start, end)"""
@@ -376,12 +380,15 @@ def plot_total_histogram(all_fractions_by_sample, out_png, region_str, chrom, si
     return delta_bic, outlier_info, biallelic_info
 
 def process_single_file(pat_file, chrom, site_start, site_end, strict=True, min_informative=10,
-                        expand_counts_flag=False, out_dir=".", sample_name=None, min_reads_plot=1):
+                        expand_counts_flag=False, out_dir=".", sample_name=None, min_reads_plot=1,
+                        upstream_extend=None):
     """Process a single pat file"""
     if sample_name is None:
         sample_name = op.basename(pat_file)
-     
-    new_start = max(1, site_start - 1500)
+
+    if upstream_extend is None:
+        upstream_extend = MAX_PAT_LEN
+    new_start = max(1, site_start - upstream_extend)
     pat_region = f"{chrom}:{new_start}-{site_end - 1}"
     pat_text = pull_tabix(pat_file, pat_region)
     fracs, read_rows = parse_pat_lines(pat_text, site_start, site_end, strict=strict, min_informative=min_informative)
@@ -493,6 +500,8 @@ def main():
     parser.add_argument('--site_coords', action='store_true',
                         help='Interpret region as CpG site-index coordinates')
     parser.add_argument('--genome', default=None, help='Genome name (e.g., hg19)')
+    parser.add_argument('-np', '--nanopore', action='store_true',
+                        help='Pull very long reads starting before the requested region (nanopore/long-read data)')
     args = parser.parse_args()
     
     if args.files:
@@ -521,13 +530,17 @@ def main():
         chrom = gr.chrom
         s1, s2 = gr.sites
     
+    upstream_extend = NANOPORE_EXTEND if args.nanopore else MAX_PAT_LEN
+
     summaries = []
     all_fractions_by_sample = {}
-    
+
     if not pat_files:
         print("No pat files found. Exiting.", file=sys.stderr)
         return
-    
+
+    print(f"Processing {len(pat_files)} files (upstream_extend={upstream_extend})...", file=sys.stderr)
+
     for pat in pat_files:
         print(f"Processing {pat} ...", file=sys.stderr)
         try:
@@ -537,7 +550,8 @@ def main():
                                           expand_counts_flag=args.expand_counts,
                                           out_dir=args.out_dir,
                                           sample_name=op.basename(pat),
-                                          min_reads_plot=args.min_reads_plot)
+                                          min_reads_plot=args.min_reads_plot,
+                                          upstream_extend=upstream_extend)
             summaries.append(summary)
             if len(summary['fractions']) > 0:
                 all_fractions_by_sample[summary['sample']] = summary['fractions']

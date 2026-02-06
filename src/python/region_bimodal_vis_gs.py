@@ -21,9 +21,13 @@ import sys
 import time
 from genomic_region import GenomicRegion
 from sklearn.mixture import GaussianMixture
+from utils_wgbs import MAX_PAT_LEN
 
-METHYLATED = set(list("CMcm"))
-UNMETHYLATED = set(list("TUtu"))
+METHYLATED = set(list("CM"))
+UNMETHYLATED = set(list("TU"))
+
+# Nanopore upstream extend (in CpG sites) to capture long reads
+NANOPORE_EXTEND = 100000
 
 # Track when we last refreshed the GCS token
 _last_token_refresh = 0
@@ -98,59 +102,20 @@ def parse_region(region):
 def pull_tabix(pat_file, region_str):
     """
     Use tabix to extract lines for region_str.
-    For GCS files without native tabix support, uses gsutil with tabix.
+    Works for both local and GCS files (GCS requires GCS_OAUTH_TOKEN).
     """
     if is_gcs_path(pat_file):
-        # Use gsutil streaming approach for GCS files
-        return pull_tabix_gcs_via_gsutil(pat_file, region_str)
-    
-    # Local files: use tabix directly
+        refresh_gcs_token_if_needed()
+
     cmd = ["tabix", pat_file, region_str]
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+        out = subprocess.check_output(cmd, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode('utf-8') if e.stderr else ""
+        if 'Permission denied' in stderr or 'InvalidArgument' in stderr:
+            print(f"Warning: tabix access failed for {pat_file}: {stderr.strip()}", file=sys.stderr)
         return ""
     return out.decode('utf-8')
-
-def pull_tabix_gcs_via_gsutil(gcs_file, region_str):
-    """
-    Pull region from GCS file by streaming through gsutil.
-    This downloads the file and index temporarily just for the tabix query.
-    """
-    import tempfile
-    import shutil
-    
-    # Create temp directory
-    temp_dir = tempfile.mkdtemp(prefix='gcs_tabix_')
-    
-    try:
-        # Download file and index
-        basename = op.basename(gcs_file)
-        local_file = op.join(temp_dir, basename)
-        local_index = local_file + '.csi'
-        
-        # Download main file
-        subprocess.check_call(['gsutil', '-q', 'cp', gcs_file, local_file],
-                            stderr=subprocess.DEVNULL)
-        
-        # Download index
-        subprocess.check_call(['gsutil', '-q', 'cp', gcs_file + '.csi', local_index],
-                            stderr=subprocess.DEVNULL)
-        
-        # Run tabix on local copy
-        cmd = ["tabix", local_file, region_str]
-        try:
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-            result = out.decode('utf-8')
-        except subprocess.CalledProcessError:
-            result = ""
-        
-        return result
-        
-    finally:
-        # Clean up
-        if op.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
 def parse_pat_lines(pat_text, region_start, region_end, strict=True, min_informative=10):
     """Parse tabix output into per-read entries"""
@@ -493,12 +458,15 @@ def plot_total_histogram(all_fractions_by_sample, out_png, region_str, chrom, si
     return delta_bic, outlier_info, biallelic_info
 
 def process_single_file(pat_file, chrom, site_start, site_end, strict=True, min_informative=10,
-                        expand_counts_flag=False, out_dir=".", sample_name=None, min_reads_plot=1):
+                        expand_counts_flag=False, out_dir=".", sample_name=None, min_reads_plot=1,
+                        upstream_extend=None):
     """Process a single pat file (local or GCS)"""
     if sample_name is None:
         sample_name = op.basename(pat_file)
-    
-    new_start = max(1, site_start - 1500)
+
+    if upstream_extend is None:
+        upstream_extend = MAX_PAT_LEN
+    new_start = max(1, site_start - upstream_extend)
     pat_region = f"{chrom}:{new_start}-{site_end - 1}"
     
     # Call tabix directly - works for both local and GCS files
@@ -613,6 +581,8 @@ def main():
     parser.add_argument('--site_coords', action='store_true',
                         help='Interpret region as CpG site-index coordinates')
     parser.add_argument('--genome', default=None, help='Genome name (e.g., hg19)')
+    parser.add_argument('-np', '--nanopore', action='store_true',
+                        help='Pull very long reads starting before the requested region (nanopore/long-read data)')
     args = parser.parse_args()
     
     # Resolve pat files list
@@ -658,15 +628,17 @@ def main():
         chrom = gr.chrom
         s1, s2 = gr.sites
     
+    upstream_extend = NANOPORE_EXTEND if args.nanopore else MAX_PAT_LEN
+
     summaries = []
     all_fractions_by_sample = {}
-    
+
     if not pat_files:
         print("No pat files found. Exiting.", file=sys.stderr)
         return
-    
-    print(f"Processing {len(pat_files)} files...", file=sys.stderr)
-    
+
+    print(f"Processing {len(pat_files)} files (upstream_extend={upstream_extend})...", file=sys.stderr)
+
     for pat in pat_files:
         print(f"Processing {pat} ...", file=sys.stderr)
         try:
@@ -676,7 +648,8 @@ def main():
                                           expand_counts_flag=args.expand_counts,
                                           out_dir=args.out_dir,
                                           sample_name=op.basename(pat),
-                                          min_reads_plot=args.min_reads_plot)
+                                          min_reads_plot=args.min_reads_plot,
+                                          upstream_extend=upstream_extend)
             summaries.append(summary)
             if len(summary['fractions']) > 0:
                 all_fractions_by_sample[summary['sample']] = summary['fractions']

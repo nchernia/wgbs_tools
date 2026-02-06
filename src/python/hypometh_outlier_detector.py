@@ -299,59 +299,52 @@ def main():
     print(f"Processing {len(pat_files)} donors x {len(regions)} regions "
           f"(upstream_extend={extend_upstream})...", file=sys.stderr)
 
-    outliers = []
+    fieldnames = ['donor', 'region', 'chrom', 'start', 'end', 'high_meth_reads']
     total_checks = len(pat_files) * len(regions)
     checked = 0
+    total_outliers = 0
 
-    for pat_file in pat_files:
-        donor_name = op.basename(pat_file).replace('.pat.gz', '')
-        print(f"\nProcessing {donor_name}...", file=sys.stderr)
-
-        donor_outliers = 0
-
-        for region in regions:
-            checked += 1
-            if checked % 100 == 0:
-                print(f"  Progress: {checked}/{total_checks} ({100*checked/total_checks:.1f}%)", file=sys.stderr)
-
-            is_outlier, high_meth_count = check_region_donor(
-                pat_file,
-                region,
-                min_high_meth_reads=args.min_reads,
-                meth_threshold=args.meth_threshold,
-                min_informative=args.min_informative,
-                extend_upstream=extend_upstream
-            )
-            
-            if is_outlier:
-                outliers.append({
-                    'donor': donor_name,
-                    'region': region['name'],
-                    'chrom': region['chrom'],
-                    'start': region['genomic_start'],
-                    'end': region['genomic_end'],
-                    'high_meth_reads': high_meth_count
-                })
-                donor_outliers += 1
-        
-        print(f"  Found {donor_outliers} outlier regions for {donor_name}", file=sys.stderr)
-    
-    # Write output
-    print(f"\nWriting {len(outliers)} outliers to {args.output}...", file=sys.stderr)
-    
     with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['donor', 'region', 'chrom', 'start', 'end', 'high_meth_reads'])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(outliers)
-    
-    print(f"Done! Found {len(outliers)} region-donor outlier pairs.", file=sys.stderr)
-    
-    # Summary stats
-    if outliers:
-        unique_donors = len(set(o['donor'] for o in outliers))
-        unique_regions = len(set(o['region'] for o in outliers))
-        print(f"  Unique donors with outliers: {unique_donors}", file=sys.stderr)
-        print(f"  Unique regions with outliers: {unique_regions}", file=sys.stderr)
+
+        for pat_file in pat_files:
+            donor_name = op.basename(pat_file).replace('.pat.gz', '')
+            print(f"\nProcessing {donor_name}...", file=sys.stderr)
+
+            donor_outliers = 0
+
+            for region in regions:
+                checked += 1
+                if checked % 100 == 0:
+                    print(f"  Progress: {checked}/{total_checks} ({100*checked/total_checks:.1f}%)", file=sys.stderr)
+
+                is_outlier, high_meth_count = check_region_donor(
+                    pat_file,
+                    region,
+                    min_high_meth_reads=args.min_reads,
+                    meth_threshold=args.meth_threshold,
+                    min_informative=args.min_informative,
+                    extend_upstream=extend_upstream
+                )
+
+                if is_outlier:
+                    row = {
+                        'donor': donor_name,
+                        'region': region['name'],
+                        'chrom': region['chrom'],
+                        'start': region['genomic_start'],
+                        'end': region['genomic_end'],
+                        'high_meth_reads': high_meth_count
+                    }
+                    writer.writerow(row)
+                    f.flush()
+                    donor_outliers += 1
+                    total_outliers += 1
+
+            print(f"  Found {donor_outliers} outlier regions for {donor_name}", file=sys.stderr)
+
+    print(f"\nDone! Found {total_outliers} region-donor outlier pairs in {args.output}.", file=sys.stderr)
 
 if __name__ == '__main__':
     main()

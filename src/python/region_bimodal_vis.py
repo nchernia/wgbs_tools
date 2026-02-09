@@ -18,8 +18,8 @@ from genomic_region import GenomicRegion
 from sklearn.mixture import GaussianMixture
 from utils_wgbs import MAX_PAT_LEN
 
-METHYLATED = set(list("CM"))
-UNMETHYLATED = set(list("TU"))
+METHYLATED = set(list("CMcm"))
+UNMETHYLATED = set(list("TUtu"))
 
 # Nanopore upstream extend (in CpG sites) to capture long reads
 NANOPORE_EXTEND = 100000

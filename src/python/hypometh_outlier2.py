@@ -32,8 +32,8 @@ import sys
 import time
 import csv
 
-METHYLATED = set(list("CM"))
-UNMETHYLATED = set(list("TU"))
+METHYLATED = set(list("CMcm"))
+UNMETHYLATED = set(list("TUtu"))
 
 MAX_PAT_LEN = 150
 NANOPORE_EXTEND = 100000

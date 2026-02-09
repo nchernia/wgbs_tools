@@ -164,8 +164,9 @@ def pull_tabix(pat_file, chrom, start, end, extend_upstream=None):
         return out.decode('utf-8')
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode('utf-8') if e.stderr else ""
-        if 'Permission denied' in stderr:
-            print(f"Warning: GCS permission denied for {pat_file}", file=sys.stderr)
+        if stderr:
+            print(f"Warning: tabix failed for {op.basename(pat_file)} "
+                  f"{region_str}: {stderr.strip()}", file=sys.stderr)
         return ""
 
 def count_high_meth_reads(pat_text, region_start, region_end, meth_threshold=0.7, min_informative=10):

@@ -9,7 +9,6 @@ import argparse
 import glob
 import os.path as op
 import sys
-import warnings
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -17,7 +16,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 
 from genomic_region import GenomicRegion
-from utils_wgbs import MAX_PAT_LEN
+from utils_wgbs import MAX_PAT_LEN, load_beta_data, beta2vec
 from region_bimodal_vis import (
     parse_region,
     pull_tabix,
@@ -40,7 +39,7 @@ def get_genomic_positions(gr, site_start, site_end):
 def plot_region_highlight_donor(
     region,
     highlight_pat,
-    pat_files,
+    beta_files,
     genomic_pos=None,
     strict=True,
     min_informative=10,
@@ -50,37 +49,14 @@ def plot_region_highlight_donor(
     """
     Visualization-only:
       1) Per-read heatmap for highlighted donor (sorted high->low methylation)
-      2) Per-CpG mean methylation across all donors, highlight one donor
+      2) Per-CpG mean methylation across all donors (from .beta files), highlight one
     """
     chrom, site_start, site_end = parse_region(region)
     region_len = site_end - site_start
     region_str = f"{chrom}:{site_start}-{site_end}"
 
     # -------------------------------------------------------
-    # Helper: per-donor CpG means + read count
-    # -------------------------------------------------------
-    def donor_cpg_means(pat_file):
-        new_start = max(1, site_start - upstream_extend)
-        pat_region = f"{chrom}:{new_start}-{site_end - 1}"
-        pat_text = pull_tabix(pat_file, pat_region)
-
-        fracs, read_rows = parse_pat_lines(
-            pat_text,
-            site_start,
-            site_end,
-            strict=strict,
-            min_informative=min_informative,
-        )
-
-        if not read_rows:
-            return np.full(region_len, np.nan), 0
-
-        rows = expand_rows(read_rows)
-        mat = np.vstack(rows)
-        return np.nanmean(mat, axis=0), mat.shape[0]
-
-    # -------------------------------------------------------
-    # 1) Highlight donor: per-read heatmap
+    # 1) Highlight donor: per-read heatmap (from .pat.gz)
     # -------------------------------------------------------
     new_start = max(1, site_start - upstream_extend)
     pat_region = f"{chrom}:{new_start}-{site_end - 1}"
@@ -110,30 +86,38 @@ def plot_region_highlight_donor(
     n_reads_highlight = rows_sorted.shape[0]
 
     # -------------------------------------------------------
-    # 2) Per-CpG means across all donors
+    # 2) Per-CpG betas across all donors (from .beta files)
     # -------------------------------------------------------
     donor_names = []
-    all_means = []
-    donor_read_counts = []
+    all_betas = []
+    sites = (site_start, site_end)
 
-    for pf in pat_files:
-        donor_names.append(op.splitext(op.basename(pf))[0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            means, n_reads = donor_cpg_means(pf)
-            all_means.append(means)
-            donor_read_counts.append(n_reads)
+    for bf in beta_files:
+        stem = op.splitext(op.basename(bf))[0]
+        # strip .pat if the beta was named donor.pat.beta
+        if stem.endswith(".pat"):
+            stem = stem[:-4]
+        donor_names.append(stem)
+        data = load_beta_data(bf, sites)
+        all_betas.append(beta2vec(data))
 
-    all_means = np.array(all_means)
+    all_betas = np.array(all_betas)
     n_donors = len(donor_names)
 
-    highlight_name = op.splitext(op.basename(highlight_pat))[0]
-    idx_highlight = donor_names.index(highlight_name)
+    highlight_stem = op.splitext(op.basename(highlight_pat))[0]
+    if highlight_stem.endswith(".pat"):
+        highlight_stem = highlight_stem[:-4]
+    try:
+        idx_highlight = donor_names.index(highlight_stem)
+    except ValueError:
+        print(f"[Error] Highlight stem '{highlight_stem}' not found among beta files.",
+              file=sys.stderr)
+        return
 
     mask = np.ones(n_donors, dtype=bool)
     mask[idx_highlight] = False
 
-    mean_others = np.nanmean(all_means[mask], axis=0)
+    mean_others = np.nanmean(all_betas[mask], axis=0)
 
     # -------------------------------------------------------
     # X-axis: genomic positions or CpG index fallback
@@ -150,7 +134,7 @@ def plot_region_highlight_donor(
     # Plot
     # -------------------------------------------------------
     fig = plt.figure(figsize=(14, 6))
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1])
+    gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.3])
 
     # LEFT: per-read heatmap (discrete: 0=blue, 1=red, NaN=gray)
     ax0 = fig.add_subplot(gs[0])
@@ -171,18 +155,8 @@ def plot_region_highlight_donor(
             norm=norm,
         )
         ax0.set_ylabel("Reads (sorted high \u2192 low methylation)")
-        ax0.set_title(f"{highlight_name}\n{region_str}  ({n_reads_highlight} reads)")
-
-        # Genomic position x-axis on heatmap
-        if use_genomic:
-            n_ticks = min(6, region_len)
-            tick_idx = np.linspace(0, region_len - 1, n_ticks, dtype=int)
-            ax0.set_xticks(tick_idx)
-            ax0.set_xticklabels(
-                [f"{genomic_pos[i]:,}" for i in tick_idx],
-                rotation=45, ha="right", fontsize=8,
-            )
-            ax0.set_xlabel(x_label)
+        ax0.set_xlabel("CpG index in region")
+        ax0.set_title(f"{highlight_stem}\n{region_str}  ({n_reads_highlight} reads)")
 
         cbar = fig.colorbar(im, ax=ax0, fraction=0.03, ticks=[0, 1])
         cbar.ax.set_yticklabels(["Unmeth", "Meth"])
@@ -191,15 +165,15 @@ def plot_region_highlight_donor(
     ax1 = fig.add_subplot(gs[1])
 
     for i in np.where(mask)[0]:
-        ax1.plot(x_scatter, all_means[i], color="lightgray", alpha=0.6,
+        ax1.plot(x_scatter, all_betas[i], color="lightgray", alpha=0.6,
                  linewidth=0.7, zorder=1)
 
     ax1.plot(x_scatter, mean_others, color="black", linewidth=2,
              label="Mean (others)", zorder=3)
-    ax1.plot(x_scatter, all_means[idx_highlight], color="lightblue",
+    ax1.plot(x_scatter, all_betas[idx_highlight], color="steelblue",
              linewidth=1.5, zorder=3.5)
-    ax1.scatter(x_scatter, all_means[idx_highlight], color="blue", s=15,
-                label=highlight_name, zorder=4)
+    ax1.scatter(x_scatter, all_betas[idx_highlight], color="blue", s=15,
+                label=highlight_stem, zorder=4)
 
     ax1.set_xlabel(x_label)
     ax1.set_ylabel("Mean methylation (\u03b2)")
@@ -223,9 +197,9 @@ def main():
     parser.add_argument("-r", "--region", required=True,
                         help="Region string (genomic coords or CpG site indices)")
     parser.add_argument("--highlight", required=True,
-                        help="Pat file for the donor to highlight")
-    parser.add_argument("--files", nargs="*", help="Explicit list of pat files")
-    parser.add_argument("--glob", default="*.pat.gz", help="Glob pattern for pat files")
+                        help="Pat file (.pat.gz) for the donor to highlight")
+    parser.add_argument("--files", nargs="*", help="Explicit list of .beta files")
+    parser.add_argument("--glob", default="*.beta", help="Glob pattern for .beta files")
     parser.add_argument("-o", "--out_png", default=None, help="Output PNG path")
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--min_informative", type=int, default=10)
@@ -236,13 +210,10 @@ def main():
                         help="Use large upstream extend for long reads")
     args = parser.parse_args()
 
-    pat_files = args.files if args.files else sorted(glob.glob(args.glob))
-    if not pat_files:
-        print("No pat files found.", file=sys.stderr)
+    beta_files = args.files if args.files else sorted(glob.glob(args.glob))
+    if not beta_files:
+        print("No beta files found.", file=sys.stderr)
         sys.exit(1)
-
-    if args.highlight not in pat_files:
-        pat_files.append(args.highlight)
 
     # Convert region to CpG site indices
     gr = None
@@ -275,7 +246,7 @@ def main():
     plot_region_highlight_donor(
         region_str,
         args.highlight,
-        pat_files,
+        beta_files,
         genomic_pos=genomic_pos,
         strict=args.strict,
         min_informative=args.min_informative,

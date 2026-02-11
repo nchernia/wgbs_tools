@@ -13,6 +13,7 @@ import sys
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 
 from genomic_region import GenomicRegion
@@ -43,7 +44,7 @@ def plot_region_highlight_donor(
     genomic_pos=None,
     strict=True,
     min_informative=10,
-    upstream_extend=MAX_PAT_LEN,
+    upstream_extend=NANOPORE_EXTEND,
     out_png=None,
 ):
     """
@@ -180,14 +181,15 @@ def plot_region_highlight_donor(
     ax1.set_title(f"Per-CpG methylation ({n_donors} donors)")
     ax1.legend(frameon=False, fontsize=8)
     if use_genomic:
-        ax1.ticklabel_format(style="plain", axis="x")
+        ax1.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x / 1e6:.2f} Mb"))
         ax1.tick_params(axis="x", rotation=45, labelsize=8)
 
     plt.tight_layout()
     if out_png:
         plt.savefig(out_png, dpi=150, bbox_inches="tight")
         print(f"Saved {out_png}", file=sys.stderr)
-    plt.show()
+    else:
+        plt.show()
 
 
 def main():
@@ -197,7 +199,7 @@ def main():
     parser.add_argument("-r", "--region", required=True,
                         help="Region string (genomic coords or CpG site indices)")
     parser.add_argument("--highlight", required=True,
-                        help="Pat file (.pat.gz) for the donor to highlight")
+                        help="Pat file (.pat.gz) or donor stem (e.g. 1001075)")
     parser.add_argument("--files", nargs="*", help="Explicit list of .beta files")
     parser.add_argument("--glob", default="*.beta", help="Glob pattern for .beta files")
     parser.add_argument("-o", "--out_png", default=None, help="Output PNG path")
@@ -206,9 +208,20 @@ def main():
     parser.add_argument("--site_coords", action="store_true",
                         help="Region is already in CpG site-index coordinates")
     parser.add_argument("--genome", default=None, help="Genome name (e.g. hg19)")
-    parser.add_argument("-np", "--nanopore", action="store_true",
-                        help="Use large upstream extend for long reads")
+    parser.add_argument("--illumina", action="store_true",
+                        help="Use short upstream extend (Illumina reads; default is nanopore/long-read)")
     args = parser.parse_args()
+
+    # Resolve highlight pat file from stem if needed
+    highlight_pat = args.highlight
+    if not highlight_pat.endswith(".pat.gz"):
+        candidate = f"{highlight_pat}.pat.gz"
+        if op.isfile(candidate):
+            highlight_pat = candidate
+        else:
+            print(f"[Error] Cannot find pat file for '{highlight_pat}' "
+                  f"(tried {candidate})", file=sys.stderr)
+            sys.exit(1)
 
     beta_files = args.files if args.files else sorted(glob.glob(args.glob))
     if not beta_files:
@@ -232,7 +245,7 @@ def main():
         chrom = gr.chrom
         s1, s2 = gr.sites
 
-    upstream_extend = NANOPORE_EXTEND if args.nanopore else MAX_PAT_LEN
+    upstream_extend = MAX_PAT_LEN if args.illumina else NANOPORE_EXTEND
 
     # Genomic positions for x-axis
     genomic_pos = None
@@ -243,15 +256,25 @@ def main():
             print(f"Warning: could not get genomic positions: {e}", file=sys.stderr)
 
     region_str = f"{chrom}:{s1}-{s2}"
+
+    # Auto-generate output filename if not specified
+    out_png = args.out_png
+    if out_png is None:
+        donor_stem = op.splitext(op.basename(highlight_pat))[0]
+        if donor_stem.endswith(".pat"):
+            donor_stem = donor_stem[:-4]
+        safe_region = args.region.replace(":", "_").replace("-", "-")
+        out_png = f"{donor_stem}_{safe_region}.png"
+
     plot_region_highlight_donor(
         region_str,
-        args.highlight,
+        highlight_pat,
         beta_files,
         genomic_pos=genomic_pos,
         strict=args.strict,
         min_informative=args.min_informative,
         upstream_extend=upstream_extend,
-        out_png=args.out_png,
+        out_png=out_png,
     )
 
 

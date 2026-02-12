@@ -26,6 +26,7 @@ import argparse
 import subprocess
 import glob
 import gzip
+import multiprocessing as mp
 import os
 import os.path as op
 import sys
@@ -247,6 +248,62 @@ def check_region_donor(pat_file, region, min_high_meth_reads=4, meth_threshold=0
     
     return is_outlier, high_meth_count
 
+FIELDNAMES = ['donor', 'region', 'chrom', 'start', 'end', 'high_meth_reads']
+
+
+def process_donor_chunk(chunk_args):
+    """
+    Worker function: process a list of donors and write outliers to a CSV file.
+    """
+    pat_files, regions, out_csv, extend_upstream, min_reads, meth_threshold, min_informative, worker_id = chunk_args
+
+    total_outliers = 0
+    n_regions = len(regions)
+
+    with open(out_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+
+        for di, pat_file in enumerate(pat_files):
+            donor_name = op.basename(pat_file).replace('.pat.gz', '')
+            print(f"[worker {worker_id}] ({di+1}/{len(pat_files)}) {donor_name}...",
+                  file=sys.stderr)
+
+            donor_outliers = 0
+
+            for ri, region in enumerate(regions):
+                if ri % 100 == 0 and ri > 0:
+                    print(f"  [worker {worker_id}] {donor_name}: {ri}/{n_regions} regions",
+                          file=sys.stderr)
+
+                is_outlier, high_meth_count = check_region_donor(
+                    pat_file,
+                    region,
+                    min_high_meth_reads=min_reads,
+                    meth_threshold=meth_threshold,
+                    min_informative=min_informative,
+                    extend_upstream=extend_upstream,
+                )
+
+                if is_outlier:
+                    writer.writerow({
+                        'donor': donor_name,
+                        'region': region['name'],
+                        'chrom': region['chrom'],
+                        'start': region['genomic_start'],
+                        'end': region['genomic_end'],
+                        'high_meth_reads': high_meth_count,
+                    })
+                    f.flush()
+                    donor_outliers += 1
+                    total_outliers += 1
+
+            print(f"  [worker {worker_id}] {donor_name}: {donor_outliers} outlier regions",
+                  file=sys.stderr)
+
+    return total_outliers
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Detect donors with unexpected high methylation in hypomethylated regions"
@@ -254,8 +311,8 @@ def main():
     parser.add_argument('--bed', required=True, help='BED file with regions to check (can be .bed.gz)')
     parser.add_argument('--glob', default=None, help='Glob pattern for pat files (or gs://bucket/*.pat.gz)')
     parser.add_argument('--files', nargs='*', help='Explicit list of pat files (supports gs:// URLs)')
-    parser.add_argument('--output', '-o', default='outliers.csv', help='Output CSV file')
-    parser.add_argument('--min_reads', type=int, default=4, 
+    parser.add_argument('--output', '-o', default='outliers.csv', help='Output CSV file (or prefix for parallel)')
+    parser.add_argument('--min_reads', type=int, default=4,
                         help='Minimum number of highly methylated reads to flag as outlier (default: 4)')
     parser.add_argument('--meth_threshold', type=float, default=0.7,
                         help='Methylation threshold for "high" methylation (default: 0.7)')
@@ -263,8 +320,10 @@ def main():
                         help='Minimum informative CpGs per read (default: 10)')
     parser.add_argument('-np', '--nanopore', action='store_true',
                         help='Pull very long reads starting before the requested region (nanopore/long-read data)')
+    parser.add_argument('-j', '--workers', type=int, default=1,
+                        help='Number of parallel workers (default: 1)')
     args = parser.parse_args()
-    
+
     # Resolve pat files
     if args.files:
         pat_files = args.files
@@ -276,76 +335,76 @@ def main():
     else:
         print("ERROR: Must provide --files or --glob", file=sys.stderr)
         sys.exit(1)
-    
+
     if not pat_files:
         print("ERROR: No pat files found", file=sys.stderr)
         sys.exit(1)
-    
+
     # Check GCS credentials if needed
     has_gcs = any(is_gcs_path(f) for f in pat_files)
     if has_gcs and not check_gcs_credentials():
         sys.exit(1)
-    
+
     # Read regions
     print(f"Reading regions from {args.bed}...", file=sys.stderr)
     regions = read_bed_file(args.bed)
     print(f"Loaded {len(regions)} regions", file=sys.stderr)
-    
+
     if not regions:
         print("ERROR: No regions found in BED file", file=sys.stderr)
         sys.exit(1)
-    
-    # Process each donor x region
+
     extend_upstream = NANOPORE_EXTEND if args.nanopore else MAX_PAT_LEN
-    print(f"Processing {len(pat_files)} donors x {len(regions)} regions "
-          f"(upstream_extend={extend_upstream})...", file=sys.stderr)
+    n_workers = min(args.workers, len(pat_files))
 
-    fieldnames = ['donor', 'region', 'chrom', 'start', 'end', 'high_meth_reads']
-    total_checks = len(pat_files) * len(regions)
-    checked = 0
-    total_outliers = 0
+    if n_workers <= 1:
+        # Single-worker: write directly to output
+        print(f"Processing {len(pat_files)} donors x {len(regions)} regions "
+              f"(upstream_extend={extend_upstream})...", file=sys.stderr)
+        chunk_args = (pat_files, regions, args.output, extend_upstream,
+                      args.min_reads, args.meth_threshold, args.min_informative, 0)
+        total_outliers = process_donor_chunk(chunk_args)
+    else:
+        # Split donors across workers
+        chunks = [[] for _ in range(n_workers)]
+        for i, pf in enumerate(pat_files):
+            chunks[i % n_workers].append(pf)
 
-    with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        # Build per-worker output filenames
+        stem, ext = op.splitext(args.output)
+        out_csvs = [f"{stem}_{i}{ext}" for i in range(n_workers)]
 
-        for pat_file in pat_files:
-            donor_name = op.basename(pat_file).replace('.pat.gz', '')
-            print(f"\nProcessing {donor_name}...", file=sys.stderr)
+        print(f"Processing {len(pat_files)} donors x {len(regions)} regions "
+              f"with {n_workers} workers (upstream_extend={extend_upstream})...",
+              file=sys.stderr)
+        for i, csv_path in enumerate(out_csvs):
+            print(f"  Worker {i}: {len(chunks[i])} donors -> {csv_path}", file=sys.stderr)
 
-            donor_outliers = 0
+        chunk_args_list = [
+            (chunks[i], regions, out_csvs[i], extend_upstream,
+             args.min_reads, args.meth_threshold, args.min_informative, i)
+            for i in range(n_workers)
+        ]
 
-            for region in regions:
-                checked += 1
-                if checked % 100 == 0:
-                    print(f"  Progress: {checked}/{total_checks} ({100*checked/total_checks:.1f}%)", file=sys.stderr)
+        with mp.Pool(n_workers) as pool:
+            results = pool.map(process_donor_chunk, chunk_args_list)
 
-                is_outlier, high_meth_count = check_region_donor(
-                    pat_file,
-                    region,
-                    min_high_meth_reads=args.min_reads,
-                    meth_threshold=args.meth_threshold,
-                    min_informative=args.min_informative,
-                    extend_upstream=extend_upstream
-                )
+        total_outliers = sum(results)
 
-                if is_outlier:
-                    row = {
-                        'donor': donor_name,
-                        'region': region['name'],
-                        'chrom': region['chrom'],
-                        'start': region['genomic_start'],
-                        'end': region['genomic_end'],
-                        'high_meth_reads': high_meth_count
-                    }
-                    writer.writerow(row)
-                    f.flush()
-                    donor_outliers += 1
-                    total_outliers += 1
+        # Merge into single output
+        print(f"\nMerging {n_workers} files into {args.output}...", file=sys.stderr)
+        with open(args.output, 'w', newline='') as fout:
+            writer = csv.DictWriter(fout, fieldnames=FIELDNAMES)
+            writer.writeheader()
+            for csv_path in out_csvs:
+                with open(csv_path, 'r') as fin:
+                    reader = csv.DictReader(fin)
+                    for row in reader:
+                        writer.writerow(row)
+                os.remove(csv_path)
 
-            print(f"  Found {donor_outliers} outlier regions for {donor_name}", file=sys.stderr)
-
-    print(f"\nDone! Found {total_outliers} region-donor outlier pairs in {args.output}.", file=sys.stderr)
+    print(f"\nDone! Found {total_outliers} region-donor outlier pairs in {args.output}.",
+          file=sys.stderr)
 
 if __name__ == '__main__':
     main()

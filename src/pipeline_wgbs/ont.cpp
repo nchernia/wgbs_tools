@@ -40,34 +40,43 @@ void find_Cm_section(std::string &MM_str, std::string &ML_str) {
         throw std::invalid_argument("Unsupported MM field:" + MM_str);
     }
     MM_str = sMM.at(i);
-    // trim beginning of MM_str
+    // trim beginning of MM_str to get comma-separated position deltas
     std::string MM_str_s = MM_str.substr(MM_str.find_first_of(',') + 1, MM_str.length());
     std::vector<int> MM_vals = split_by_comma(MM_str_s);
-    // trim beginning of ML_str
+    int nr_MM_vals = MM_vals.size();
+
+    // Parse full ML array
     ML_str = ML_str.substr(ML_str.find_first_of(',') + 1, ML_str.length());
     std::vector<int> ML_vals = split_by_comma(ML_str);
-    int nr_MM_vals = MM_vals.size();
-    int nr_ML_vals = ML_vals.size();
-    if (!(nr_ML_vals % nr_MM_vals == 0)) {
-        std::cerr << "Error in find_Cm: not modulu 0" << std::endl;;
-        throw std::invalid_argument("Unsupported MM field:" + MM_str);
+
+    // Compute ML offset by summing sizes of all MM sections before the C+m section
+    int ml_offset = 0;
+    for (int k = 0; k < i; k++) {
+        std::string sec = sMM[k];
+        std::size_t comma_pos = sec.find_first_of(',');
+        if (comma_pos != std::string::npos && comma_pos + 1 < sec.length()) {
+            std::string sec_vals_str = sec.substr(comma_pos + 1, sec.length());
+            std::vector<int> sec_vals = split_by_comma(sec_vals_str);
+            ml_offset += sec_vals.size();
+        }
     }
-    //std::cerr << "i:\n" << i << std::endl;;
-    std::vector<int> sliced_ML_vals(ML_vals.begin() + (i * nr_MM_vals), ML_vals.begin() + ((i + 1) * nr_MM_vals));
+
+    if (ml_offset + nr_MM_vals > (int)ML_vals.size()) {
+        std::cerr << "Error in find_Cm: ML array too short (offset=" << ml_offset
+                  << " + nr_MM=" << nr_MM_vals << " > ML_size=" << ML_vals.size() << ")" << std::endl;
+        throw std::invalid_argument("Unsupported MM/ML field combination");
+    }
+
+    std::vector<int> sliced_ML_vals(ML_vals.begin() + ml_offset, ML_vals.begin() + ml_offset + nr_MM_vals);
 
     // vector of ints to string:
     std::ostringstream oss;
-    // Iterate through the vector
     for (size_t j = 0; j < sliced_ML_vals.size(); ++j) {
-        // Convert each integer to string and append to the stream
         oss << sliced_ML_vals[j];
-
-        // Add a comma if it's not the last element
         if (j < sliced_ML_vals.size() - 1) {
             oss << ",";
         }
     }
-    // Convert the stringstream to a string
     ML_str = "," + oss.str();
 }
 
